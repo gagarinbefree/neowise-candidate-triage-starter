@@ -1,0 +1,80 @@
+name: Test and deploy triage
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Optional application commit to test and publish before merging
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      publishable: ${{ steps.suite.outputs.present }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          path: source
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Check the running HTTP API
+        working-directory: source
+        run: |
+          node server.mjs &
+          trap 'kill $!' EXIT
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:3000/ > /dev/null
+          curl -fsS --json '{"text":"Когда доставка?"}' http://127.0.0.1:3000/api/triage |
+            jq -e '.status == "ready" and .topic == "delivery" and (.draft | length > 0)'
+      - name: Run the application regression suite when present
+        id: suite
+        working-directory: source
+        run: |
+          if [[ -f test/triage.test.mjs ]]; then
+            node --test
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build the static demo
+        run: node scripts/pages/build.mjs source "$RUNNER_TEMP/site"
+      - name: Test the demo in Chrome
+        env:
+          NODE_PATH: ${{ runner.temp }}/browser/node_modules
+        run: |
+          npm install --prefix "$RUNNER_TEMP/browser" --no-package-lock playwright-core@1.55.0
+          python3 -m http.server 4173 --bind 127.0.0.1 --directory "$RUNNER_TEMP/site" &
+          trap 'kill $!' EXIT
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4173/ > /dev/null
+          node scripts/pages/check.cjs http://127.0.0.1:4173/
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request' && steps.suite.outputs.present == 'true'
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.test.outputs.publishable == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - name: Publish tested demo
+        id: publish
+        uses: actions/deploy-pages@v5
